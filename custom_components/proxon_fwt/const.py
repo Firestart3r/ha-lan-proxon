@@ -62,6 +62,17 @@ def allowed_on_unverified_firmware(func: "WriteFunc") -> bool:
     return func.policy in UNVERIFIED_ALLOWED_POLICIES and not func.key.startswith("schedule_")
 
 
+# Write functions that target the hot-water controller (T300, aliases on object 1). Only these need
+# the verified (main, T300) pair; everything else writes to the main board and only needs a verified
+# main firmware. Units whose DP3:81 does not report a known T300 version (e.g. raw 4957) can then
+# still write room / ventilation functions without the opt-in.
+T300_POLICIES: frozenset[str] = frozenset({"t300", "heater"})
+
+
+def needs_t300_firmware(func: "WriteFunc") -> bool:
+    return func.policy in T300_POLICIES
+
+
 def firmware_text(raw: int | None) -> str:
     """DP0:5 / DP3:81 as shown in the app ("74" -> "7.4")."""
     return "?" if raw is None else f"{raw / 10:.1f}"

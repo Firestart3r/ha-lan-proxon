@@ -31,6 +31,7 @@ from .const import (
     VERIFIED_FIRMWARE,
     allowed_on_unverified_firmware,
     firmware_text,
+    needs_t300_firmware,
     FAULT_POINTS,
     MAX_ROOMS,
     NAME_READS_SP,
@@ -177,6 +178,7 @@ class ProxonCoordinator(DataUpdateCoordinator[ProxonData]):
         self._names: dict[int, str] = {}
         self.firmware_ok: bool | None = None       # main firmware == verified main firmware
         self.firmware_verified: bool | None = None  # (main, T300) pair in VERIFIED_FIRMWARE
+        self._write_verified = False  # firmware check of the current write batch (main only or pair)
         self.allow_unverified = bool(entry.options.get(CONF_ALLOW_UNVERIFIED_FIRMWARE, False))
         self._write_retries = MAX_WRITE_RETRIES
         self.unverified_write_locked: str | None = None  # reason, set after an unconfirmed opt-in write
@@ -223,10 +225,15 @@ class ProxonCoordinator(DataUpdateCoordinator[ProxonData]):
         verified = (fw, fw_t300) in VERIFIED_FIRMWARE
         if self.firmware_verified is None and not verified:
             _LOGGER.warning(
-                "Firmware %s / T300 %s is not verified for writes (verified: %s / %s); writes are %s",
+                "Firmware %s / T300 %s is not verified for writes (verified: %s / %s); %s",
                 firmware_text(fw), firmware_text(fw_t300), firmware_text(EXPECTED_FIRMWARE_MAIN),
                 firmware_text(EXPECTED_FIRMWARE_T300),
-                "enabled by the user's opt-in (single attempt, no resends)" if self.allow_unverified else "blocked",
+                "main-board writes stay enabled (main firmware verified), T300 writes are blocked"
+                if self.firmware_ok
+                else (
+                    "writes are enabled by the user's opt-in (single attempt, no resends)"
+                    if self.allow_unverified else "writes are blocked"
+                ),
             )
         self.firmware_verified = verified
 
@@ -346,7 +353,7 @@ class ProxonCoordinator(DataUpdateCoordinator[ProxonData]):
         rb2 = (await self.client.call(session, session.read_sp_list, [func.read]))[0]
         if rb1 != value or rb2 != value:
             self._note_write_error(func, f"{last_problem}; Rücklesung {rb1}/{rb2}, erwartet {value}")
-            if not self.firmware_verified:
+            if not self._write_verified:
                 # The alias may map to a different register on this firmware: do not try again.
                 self.unverified_write_locked = f"{func.key}: Rücklesung {rb1}/{rb2}, erwartet {value}"
                 _LOGGER.error(
@@ -380,7 +387,12 @@ class ProxonCoordinator(DataUpdateCoordinator[ProxonData]):
         fw, fw_t300 = dpv.get(DP_FIRMWARE_MAIN), dpv.get(DP_FIRMWARE_T300)
         self.firmware_ok = fw == EXPECTED_FIRMWARE_MAIN
         self.firmware_verified = (fw, fw_t300) in VERIFIED_FIRMWARE
-        if self.firmware_verified:
+        # Main-board functions only need the verified main firmware; T300 functions need the pair.
+        if any(needs_t300_firmware(f) for f, _ in items):
+            self._write_verified = bool(self.firmware_verified)
+        else:
+            self._write_verified = bool(self.firmware_ok)
+        if self._write_verified:
             self._write_retries = MAX_WRITE_RETRIES
         else:
             shown = f"{firmware_text(fw)} / T300 {firmware_text(fw_t300)}"
@@ -426,10 +438,12 @@ class ProxonCoordinator(DataUpdateCoordinator[ProxonData]):
             if func.policy == "cooling":
                 if mode not in (1, 2, 3):
                     raise ProxonWriteError(f"Kühlfreigabe nur in Sommer/Winter/ECO (Betriebsart {mode})")
-                if mode in (1, 3) and (dpv.get(DP_PTC_RELAY_A) or dpv.get(DP_PTC_RELAY_B)):
+                # ECO Komfort (3) allows cooling and room PTC at the same time (as in the original app);
+                # in summer mode (1) the relay interlock is kept until verified otherwise.
+                if mode == 1 and (dpv.get(DP_PTC_RELAY_A) or dpv.get(DP_PTC_RELAY_B)):
                     raise ProxonWriteError("PTC-Relais aktiv: Kühlfreigabe gesperrt")
-            if func.policy == "ptc" and value != 0 and mode not in (1, 2):
-                raise ProxonWriteError(f"PTC-Freigabe nur in Sommer/Winter (Betriebsart {mode})")
+            if func.policy == "ptc" and value != 0 and mode not in (1, 2, 3):
+                raise ProxonWriteError(f"PTC-Freigabe nur in Sommer/Winter/ECO (Betriebsart {mode})")
 
     async def async_write_switch(self, func: WriteFunc, on: bool) -> None:
         await self.async_write(func, 1 if on else 0)
